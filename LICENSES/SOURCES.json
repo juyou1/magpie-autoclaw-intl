@@ -30,6 +30,14 @@
       ]
     },
     {
+      "repository": "https://github.com/aimod-cc/Agent2API",
+      "license": "See the repository's own LICENSE; the parts taken are its sign-in flow design, cited here for provenance",
+      "taken": [
+        { "into": "src/weblogin.mjs, src/callback.mjs", "what": "the remote sign-in shape: the pasted callback (whole URL, bare query, bare code), the flow replaced by a new one, the desktop redirect taken when it can reach" },
+        { "into": "src/weblogin-page.mjs", "what": "the login page's captcha flow and the wording that tells the user to copy the address the browser ended on" }
+      ]
+    },
+    {
       "repository": "https://github.com/magpie-community/plugins",
       "path": "packages/autoclaw",
       "version": "@magpie-community/opencode-autoclaw-auth 0.2.25",

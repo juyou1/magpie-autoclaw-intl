@@ -33,12 +33,38 @@ Four ways:
 
 | Way | What happens |
 | --- | --- |
-| **Web sign-in (Z.ai / Google)** | Opens a local guide page: complete the security check, the browser goes to Z.ai's or Google's own authorization page, and comes back to magpie by itself. The callback uses one of the four loopback ports the official client registered (18432 / 19654 / 19723 / 53699); if they are all taken (the official client running, say) you are asked to close it first. |
+| **Web sign-in (Z.ai / Google)** | Opens a login page of the plugin's own: complete the security check, and the page takes you to Z.ai's or Google's own authorization page. When you are done, the vendor sends the browser to `http://localhost:<port>/auth/callback-…` — **that page not loading is normal** (it points at the machine magpie runs on). Copy the whole address from the address bar and paste it into the sign-in's Callback URL field. On a desktop install nothing is pasted: the redirect comes straight back to the plugin and completes by itself. |
 | **Access Token** | Paste an access token. The refresh token is optional, but without one the sign-in can't renew. |
 | **Credentials JSON** | Paste one account's credential JSON, or the client's whole `auth.json`. `enc:` values are decrypted with the local client's key. |
 | **Desktop sign-in** | Reads the official client's sign-in, no browser. Read-only: the client's files are never changed. |
 
 magpie keeps the sign-in (`plugin-auth.json`). Refresh tokens rotate; the plugin makes sure one is exchanged only once.
+
+### Installing in a container or on a server
+
+The same shape as Agent2API's remote panel: the captcha runs in your browser and the callback is pasted back — **nothing depends on the container receiving the redirect**. Map one port for the login page and tell the plugin the address your browser reaches it at:
+
+```
+docker run … -p 18433:18433 \
+  -e AUTOCLAW_LOGIN_PORT=18433 \
+  -e AUTOCLAW_LOGIN_HOST=0.0.0.0 \
+  -e AUTOCLAW_LOGIN_PUBLIC_URL=http://<the container's outside address>:18433 \
+  …
+```
+
+| Variable | What it does |
+| --- | --- |
+| `AUTOCLAW_LOGIN_PORT` | The login page's port, `18433` by default. Map it out. |
+| `AUTOCLAW_LOGIN_HOST` | What to listen on. `0.0.0.0` in a container, so the port can be reached from outside. |
+| `AUTOCLAW_LOGIN_PUBLIC_URL` | The address your browser opens the page at (the container's domain or IP:port), e.g. `http://box.example.com:18433`. Left unset, a desktop install works as it is (`127.0.0.1`). |
+
+The page's port can be open to the network safely: the page's address carries a random token for this one sign-in, every request must bring it, and a request from another site is turned away by its Origin — knowing the port isn't enough to drive the sign-in. The callback ports (18432 and its three siblings) listen on magpie's own loopback only and need no mapping.
+
+The steps, from a container:
+
+1. Start the sign-in in magpie; it gives the login page's address (a link under `AUTOCLAW_LOGIN_PUBLIC_URL`).
+2. Open it in your browser, complete the security check, and sign in on the vendor's page.
+3. The browser lands on a `localhost` page that doesn't load — normal. Copy its whole address from the address bar, paste it into the sign-in's Callback URL field, and the sign-in completes.
 
 ## Usage and check-in
 

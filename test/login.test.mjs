@@ -1,14 +1,17 @@
 import assert from "node:assert/strict"
 import { once } from "node:events"
+import * as net from "node:net"
 import { test } from "node:test"
 
-import { credentialJsonMethod, parseCredentialJson, startLocalOauth, successFrom, tokenMethod, verifyCredentials, webLoginMethod } from "../src/login.mjs"
-import { ALIYUN_CAPTCHA_JS } from "../src/util.mjs"
+import { loginMethods, parseLoginAddress, startWebLogin, webLoginMethod } from "../src/login.mjs"
+import { resetWebLogins } from "../src/login.mjs"
 
 const JWT = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ user_id: "777", device_id: "ddev", exp: 4070902400 })).toString("base64url")}.sig`
 const STATE = "vendor-state-1"
+const AUTH_URL = "https://accounts.example.com/auth?state=" + STATE
+const REGISTERED = [18432, 19654, 19723, 53699]
 
-/** A stand-in for the vendor: answers the four routes the sign-in uses and records what it was asked. */
+/** A stand-in vendor: the routes a sign-in uses, and a record of what it was asked. */
 function fakeVendor({ captchaEnabled = true, refuseExchange = false } = {}) {
   const calls = []
   const fetchImpl = async (url, init = {}) => {
@@ -17,12 +20,11 @@ function fakeVendor({ captchaEnabled = true, refuseExchange = false } = {}) {
     calls.push({ url, body, headers })
     const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } })
     if (url.endsWith("/userapi/overseasv1/oauth-captcha-config")) {
-      return json({ code: 0, data: captchaEnabled ? { enabled: true, captcha_supplier: "aliyun", region: "cn-hangzhou", prefix: "sq51tr", scene_id: "scene1" } : { enabled: false } })
+      return json({ code: 0, data: captchaEnabled ? { enabled: true, captcha_supplier: "aliyun", region: "ga", prefix: "sq51tr", scene_id: "scene1" } : { enabled: false } })
     }
     if (/\/userapi\/overseasv1\/(zai|google)-oauth-url$/.test(url)) {
-      if (!captchaEnabled) return json({ code: 0, data: { oauth_url: "https://accounts.example.com/auth?state=" + STATE } })
-      if (!body.ali_captcha_verify_param) return json({ code: 631002, msg: "当前版本已停止服务" })
-      return json({ code: 0, data: { oauth_url: "https://accounts.example.com/auth?state=" + STATE } })
+      if (captchaEnabled && !body.ali_captcha_verify_param) return json({ code: 631002, msg: "当前版本已停止服务" })
+      return json({ code: 0, data: { oauth_url: AUTH_URL } })
     }
     if (/\/userapi\/overseasv1\/(zai|google)-oauth-login$/.test(url)) {
       if (refuseExchange) return json({ code: 631001, msg: "User login error" })
@@ -36,9 +38,8 @@ function fakeVendor({ captchaEnabled = true, refuseExchange = false } = {}) {
   return { fetchImpl, calls }
 }
 
-/** Ports free on this machine, standing in for the client's registered pool. */
+/** Ports free on this machine, standing in for the vendor's registered callback port and the login page's port. */
 async function freePorts(count) {
-  const net = await import("node:net")
   const out = []
   for (let i = 0; i < count; i++) {
     const server = net.createServer()
@@ -51,273 +52,406 @@ async function freePorts(count) {
   return out
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const getJson = (url, init) => fetch(url, init).then((r) => r.json())
 
-test("successFrom: the JWT's user_id is the identity; email and nickname are separate fields", () => {
-  const s = successFrom({ accessToken: `Bearer ${JWT}`, refreshToken: "Bearer rt", deviceId: "devfile", userId: "external-id", userName: "Ada", email: "ada@example.com", now: () => 1 })
-  assert.equal(s.type, "success")
-  assert.equal(s.access, JWT)
-  assert.equal(s.refresh, "rt")
-  assert.equal(s.uid, "777")
-  assert.equal(s.accountId, "ada@example.com")
-  assert.equal(s.email, "ada@example.com")
-  assert.equal(s.name, "Ada")
-  assert.equal(s.expires, 4_070_902_400_000 - 600_000)
-  assert.equal(s.deviceId, "devfile")
-})
+/** Whether a port can be listened on right now. */
+const portIsFree = (port) =>
+  new Promise((resolve) => {
+    const probe = net.createServer()
+    probe.once("error", () => resolve(false))
+    probe.listen(port, "127.0.0.1", () => probe.close(() => resolve(true)))
+  })
 
-test("successFrom: what isn't known is left out", () => {
-  assert.deepEqual(successFrom({ accessToken: "opaque", refreshToken: "", now: () => 1 }), { type: "success", access: "opaque" })
-  const named = successFrom({ accessToken: "opaque", refreshToken: "", userId: "u1", userName: "Bob" })
-  assert.equal(named.accountId, "u1")
-  assert.equal(named.name, "Bob")
-  assert.equal("email" in named, false)
-})
-
-test("successFrom: a public field never carries the credential, a control character or an over-long value", () => {
-  assert.deepEqual(successFrom({ accessToken: "opaque", refreshToken: "rt", userId: "opaque" }), { type: "success", access: "opaque", refresh: "rt" })
-  assert.deepEqual(successFrom({ accessToken: "t", refreshToken: "rt", userId: "rt" }), { type: "success", access: "t", refresh: "rt" })
-  assert.deepEqual(successFrom({ accessToken: "t", refreshToken: "", userId: "u\u007f1" }), { type: "success", access: "t" })
-  assert.deepEqual(successFrom({ accessToken: "t", refreshToken: "", userId: "x".repeat(1025) }), { type: "success", access: "t" })
-  assert.deepEqual(successFrom({ accessToken: "t", refreshToken: "", userId: "42" }), { type: "success", access: "t", uid: "42", accountId: "42" })
-})
-
-test("successFrom: a response without a usable access token is an error", () => {
-  assert.throws(() => successFrom({ accessToken: "", refreshToken: "" }), /没有有效的 access_token/)
-  assert.throws(() => successFrom({ accessToken: "has space", refreshToken: "" }), /没有有效的 access_token/)
-})
-
-test("parseCredentialJson: a credential object, a whole auth.json, and what is refused", () => {
-  assert.equal(parseCredentialJson('{"token":"t","userInfo":{"email":"x@y.z"}}').email, "x@y.z")
-  assert.equal(parseCredentialJson('{"provider":"autoclaw-intl","token":"t"}').token, "t")
-  assert.throws(() => parseCredentialJson("{bad"), /JSON 格式无效/)
-  assert.throws(() => parseCredentialJson("[1]"), /必须是 JSON 对象/)
-  assert.throws(() => parseCredentialJson('{"provider":"autoclaw-cn","token":"t"}'), /不属于国际版/)
-})
-
-test("verifyCredentials: a pasted token is checked against the vendor and completed from the profile", async () => {
-  const vendor = fakeVendor()
-  const v = await verifyCredentials({ token: `Bearer ${JWT}`, refreshToken: "rt" }, { fetchImpl: vendor.fetchImpl })
-  assert.equal(v.access, JWT)
-  assert.equal(v.uid, "777")
-  assert.equal(v.accountId, "ada@example.com")
-  assert.equal(v.deviceId, "ddev")
-
-  const bare = await verifyCredentials({ token: "opaque-without-identity", refreshToken: "" }, { fetchImpl: vendor.fetchImpl })
-  assert.equal(bare.uid, "external-id")
-  assert.match(bare.deviceId, /^[0-9a-f]{64}$/)
-})
-
-test("verifyCredentials: what is refused", async () => {
-  const vendor = fakeVendor()
-  await assert.rejects(
-    verifyCredentials({ token: JWT, refreshToken: "rt", userId: "someone-else" }, { fetchImpl: vendor.fetchImpl }),
-    /用户标识与令牌身份不一致/,
-  )
-  const refused = async () => new Response(JSON.stringify({ code: 410000 }), { headers: { "content-type": "application/json" } })
-  await assert.rejects(verifyCredentials({ token: "opaque", refreshToken: "" }, { fetchImpl: refused }), /登录态已失效/)
-  const empty = async () => new Response(JSON.stringify({ code: 0, data: {} }), { headers: { "content-type": "application/json" } })
-  await assert.rejects(verifyCredentials({ token: "opaque", refreshToken: "" }, { fetchImpl: empty }), /未给出账号身份/)
-  const never = async () => {
-    throw new Error("must not request")
+/**
+ * Start a sign-in on free ports.
+ *   url            the address magpie shows the user: a container's when loginPublicUrl is set
+ *   local          where the page is really served in this test
+ *   callbackPort   the port the vendor will send the browser back to
+ */
+async function begin(options = {}, vendor = options.vendor ?? "zai") {
+  const [page, callback] = await freePorts(2)
+  const started = await startWebLogin(vendor, { ...options, loginPort: page, callbackPorts: [callback] })
+  return {
+    ...started,
+    local: `http://127.0.0.1:${page}`,
+    token: started.url.slice(started.url.lastIndexOf("/") + 1),
+    /** the port this test handed over as "registered", which the vendor is told to send the browser to */
+    callbackPort: Number(new URL(started.redirectUri).port),
+    givenPort: callback,
   }
-  await assert.rejects(verifyCredentials({ token: "enc:abc", refreshToken: "" }, { fetchImpl: never }), /enc: 加密形态/)
-  await assert.rejects(verifyCredentials({ token: "has space", refreshToken: "" }, { fetchImpl: never }), /格式无效/)
-  // the mismatched identity is refused on the token alone: the vendor is not asked
-  const before = vendor.calls.length
-  await assert.rejects(
-    verifyCredentials({ token: JWT, refreshToken: "rt", userId: "someone-else" }, { fetchImpl: vendor.fetchImpl }),
-    /用户标识与令牌身份不一致/,
-  )
-  assert.equal(vendor.calls.length, before)
+}
+
+/** Take a sign-in to the point where the vendor's authorization page was handed out. */
+async function toAuthorizationPage(vendor, options = {}) {
+  const s = await begin({ ...options, fetchImpl: vendor.fetchImpl }, options.vendor ?? "zai")
+  const headers = { "X-Login-Token": s.token }
+  const config = await getJson(s.local + "/captcha-config", { headers })
+  if (config.enabled) await fetch(s.local + "/captcha", { method: "POST", headers, body: JSON.stringify({ receipt: "opaque-receipt" }) })
+  const auth = await getJson(s.local + "/open-auth", { method: "POST", headers })
+  assert.equal(auth.url, AUTH_URL)
+  return { ...s, headers }
+}
+
+test.beforeEach(() => resetWebLogins())
+
+test("parseLoginAddress: what a container's environment gives, and the desktop default", () => {
+  assert.deepEqual(parseLoginAddress({}), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress(undefined), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PORT: "9000" }), { host: "127.0.0.1", port: 9000, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PORT: "9000", AUTOCLAW_LOGIN_HOST: "0.0.0.0" }), { host: "0.0.0.0", port: 9000, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PUBLIC_URL: "http://box.example.com:18433" }), { host: "127.0.0.1", port: 18433, publicUrl: "http://box.example.com:18433" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PUBLIC_URL: "https://box.example.com/login/" }), { host: "127.0.0.1", port: 18433, publicUrl: "https://box.example.com/login" })
+  // a value that isn't one is left out: a typo doesn't keep the user from signing in
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PORT: "abc" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PORT: "70000" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PORT: "-1" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_HOST: "nonsense" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_HOST: "192.168.1.5" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PUBLIC_URL: "javascript:alert(1)" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PUBLIC_URL: "http://user:pw@box.example.com" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
+  assert.deepEqual(parseLoginAddress({ AUTOCLAW_LOGIN_PUBLIC_URL: "not a url" }), { host: "127.0.0.1", port: 18433, publicUrl: "" })
 })
 
-test("the methods: types, prompts and that secrets are typed unseen", () => {
+test("the web sign-in is a sign-in magpie's user finishes by pasting", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl }, "google")
+  assert.equal(s.method, "code", "magpie shows a field for what the user pastes, rather than waiting for a redirect")
+  assert.equal(typeof s.callback, "function")
+  assert.match(s.url, /^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{64}$/, "on a desktop the page is opened on this machine, at an address carrying its token")
+  assert.match(s.instructions, /Callback URL/)
+  assert.ok(s.instructions.includes(s.redirectUri), "the user is told where the vendor will send the browser")
+  assert.equal(s.callbackPort, s.givenPort, "the vendor is told to send the browser to the port handed over as registered")
+  assert.equal(new URL(s.redirectUri).hostname, "localhost", "the redirect is always a localhost: the vendor only registers loopback ports")
+  await s.cancel()
+})
+
+test("the vendor is given one of the four loopback ports its client registered, when one is free", async (t) => {
+  // The registered ports may be held by the AutoClaw desktop client or another program: then this can't be checked here.
+  const free = []
+  for (const port of REGISTERED) if (await portIsFree(port)) free.push(port)
+  if (!free.length) return t.skip("all four registered callback ports are taken on this machine")
+  const vendor = fakeVendor()
+  const s = await startWebLogin("zai", { fetchImpl: vendor.fetchImpl, loginPort: (await freePorts(1))[0] })
+  assert.ok(free.includes(Number(new URL(s.redirectUri).port)), "the first free registered port is taken")
+  await s.cancel()
+})
+
+test("from a container: the redirect never reaches the plugin, the user pastes the address", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "google", loginHost: "0.0.0.0", loginPublicUrl: "http://box.example.com:18433" })
+  // the address magpie opens is the one the user's browser can reach, not the container's own
+  assert.match(s.url, /^http:\/\/box\.example\.com:18433\/[0-9a-f]{64}$/)
+  // the vendor sends the browser to a localhost that is the user's own computer: nothing there answers for it
+  const navigate = `http://localhost:${s.callbackPort}/auth/callback-google`
+  assert.equal(vendor.calls.find((c) => c.url.endsWith("google-oauth-url")).body.navigate_uri, navigate)
+  // the user copies the whole address from the address bar and pastes it into magpie
+  const result = await s.callback(`${navigate}?code=one-time-code&state=${STATE}`)
+  assert.equal(result.type, "success")
+  assert.equal(result.access, JWT)
+  assert.equal(result.refresh, "rt-1")
+  assert.equal(result.accountId, "ada@example.com")
+  assert.equal(result.uid, "777")
+  const exchange = vendor.calls.find((c) => c.url.endsWith("google-oauth-login"))
+  assert.deepEqual(
+    { code: exchange.body.code, state: exchange.body.state, navigate: exchange.body.navigate_uri },
+    { code: "one-time-code", state: STATE, navigate },
+  )
+  await assert.rejects(fetch(s.local + "/" + s.token), "the login page is closed once the sign-in is over")
+})
+
+test("on a desktop the page's server takes the vendor's redirect itself: nothing to paste", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "google" })
+  const landed = await fetch(`http://localhost:${s.callbackPort}/auth/callback-google?code=direct-hit&state=${STATE}`)
+  assert.equal(landed.status, 200)
+  assert.match(await landed.text(), /授权成功/)
+  const result = await s.callback("")
+  assert.equal(result.type, "success")
+  assert.equal(vendor.calls.find((c) => c.url.endsWith("google-oauth-login")).body.code, "direct-hit")
+})
+
+test("the redirect is also taken on the page's port, where a container's proxy sends everything", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "zai", loginHost: "0.0.0.0" })
+  const landed = await fetch(`${s.local}/auth/callback-zai?code=via-proxy&state=${STATE}`)
+  assert.match(await landed.text(), /授权成功/)
+  assert.equal((await s.callback("")).type, "success")
+  assert.equal(vendor.calls.find((c) => c.url.endsWith("zai-oauth-login")).body.code, "via-proxy")
+})
+
+test("what the user pastes: the whole address, the query string, or just the code", async () => {
+  const shapes = [
+    [`http://localhost:PORT/auth/callback-zai?code=c1&state=${STATE}`, "the whole address"],
+    [`http://localhost:PORT/auth/callback-zai/?code=c1&state=${STATE}#`, "the address as some browsers show it"],
+    [`?code=c1&state=${STATE}`, "the query string"],
+    [`code=c1&state=${STATE}`, "the query string without the question mark"],
+    [`c1`, "the bare code, which carries no state"],
+    [`  c1  `, "the bare code with spaces around it"],
+  ]
+  for (const [pasted, name] of shapes) {
+    resetWebLogins()
+    const vendor = fakeVendor()
+    const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+    const result = await s.callback(pasted.replace("PORT", String(s.callbackPort)))
+    assert.equal(result.type, "success", name)
+    const exchange = vendor.calls.find((c) => c.url.endsWith("zai-oauth-login"))
+    assert.equal(exchange.body.code, "c1", name)
+    // the state that goes back with the code is the vendor's, from this sign-in's authorization page
+    assert.equal(exchange.body.state, STATE, name)
+  }
+})
+
+test("a pasted callback is checked before anything is exchanged", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+  const exchanges = () => vendor.calls.filter((c) => c.url.endsWith("zai-oauth-login")).length
+  const port = s.callbackPort
+  // another vendor's callback
+  await assert.rejects(s.callback(`http://localhost:${port}/auth/callback-google?code=c&state=${STATE}`), /Google/)
+  // another sign-in's state
+  await assert.rejects(s.callback(`http://localhost:${port}/auth/callback-zai?code=c&state=not-this-one`), /state/)
+  await assert.rejects(s.callback(`code=c&state=still-not-it`), /state/)
+  // nothing to work with: an empty field is a submission, and says so without ending the sign-in
+  for (const junk of ["", "   ", "https://accounts.example.com/auth", "http://localhost/auth/callback-zai"]) {
+    await assert.rejects(s.callback(junk), /回调/)
+    assert.equal((await fetch(s.local + "/" + s.token)).status, 200, `the page is still up after pasting ${JSON.stringify(junk)}`)
+  }
+  assert.equal(exchanges(), 0, "none of them reached the exchange")
+  // the sign-in is still open for the right one
+  assert.equal((await s.callback(`code=the-right-code&state=${STATE}`)).type, "success")
+})
+
+test("a word that isn't a URL or a query is taken as a bare authorization code, and the vendor judges it", async () => {
+  const vendor = fakeVendor({ refuseExchange: true })
+  const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+  await assert.rejects(s.callback("hello"), /授权码无效/)
+  assert.equal(vendor.calls.filter((c) => c.url.endsWith("zai-oauth-login")).length, 1, "it reached the vendor, which refused it")
+})
+
+test("the vendor refusing the authorization ends the sign-in", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+  await assert.rejects(s.callback(`code=c&state=${STATE}&error=access_denied&error_description=the+user+declined`), /已取消或拒绝.*access_denied.*the user declined/)
+  // the sign-in is over: a pasted code now says so, and the exchange was never made
+  await assert.rejects(s.callback(`code=c&state=${STATE}`), /已取消|已过期|已结束/)
+  assert.equal(vendor.calls.filter((c) => c.url.endsWith("zai-oauth-login")).length, 0)
+})
+
+test("a callback pasted before the authorization page was handed out is refused", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl }, "zai")
+  await assert.rejects(s.callback(`http://localhost:${s.callbackPort}/auth/callback-zai?code=c&state=${STATE}`), /授权页/)
+  assert.equal(vendor.calls.filter((c) => c.url.endsWith("zai-oauth-login")).length, 0)
+  await s.cancel()
+})
+
+test("a redirect with another state is not taken: any page could send one", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+  const forged = await fetch(`http://localhost:${s.callbackPort}/auth/callback-zai?code=stolen&state=made-up`)
+  assert.equal(forged.status, 200)
+  assert.match(await forged.text(), /state/)
+  // and without a state at all: the redirect path never goes without one
+  const bare = await fetch(`http://localhost:${s.callbackPort}/auth/callback-zai?code=stolen`)
+  assert.match(await bare.text(), /state/)
+  // favicon and previews carry no code: not a callback, and the listener goes on waiting
+  assert.equal((await fetch(`http://localhost:${s.callbackPort}/favicon.ico`)).status, 404)
+  assert.equal((await fetch(`http://localhost:${s.callbackPort}/auth/callback-google?code=x&state=${STATE}`)).status, 404, "the other vendor's path isn't served on this port")
+  // the real one still completes the sign-in
+  const real = await fetch(`http://localhost:${s.callbackPort}/auth/callback-zai?code=the-real-one&state=${STATE}`)
+  assert.match(await real.text(), /授权成功/)
+  assert.equal((await s.callback("")).type, "success")
+  assert.equal(vendor.calls.find((c) => c.url.endsWith("zai-oauth-login")).body.code, "the-real-one")
+})
+
+test("with the vendor's captcha switched off, the page goes straight to the authorization page", async () => {
+  const vendor = fakeVendor({ captchaEnabled: false })
+  const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+  assert.equal("ali_captcha_verify_param" in vendor.calls.find((c) => c.url.endsWith("zai-oauth-url")).body, false)
+  assert.equal((await s.callback(`code=c&state=${STATE}`)).type, "success")
+})
+
+test("with the captcha on, the authorization page isn't handed out without the receipt", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl }, "google")
+  const headers = { "X-Login-Token": s.token }
+  const config = await getJson(s.local + "/captcha-config", { headers })
+  assert.equal(config.enabled, true)
+  assert.equal(config.sceneId, "scene1")
+  const early = await getJson(s.local + "/open-auth", { method: "POST", headers })
+  assert.match(early.error, /安全验证/)
+  // a malformed receipt is refused the same way
+  await fetch(s.local + "/captcha", { method: "POST", headers, body: JSON.stringify({ receipt: "bad\u0001receipt" }) })
+  assert.match((await getJson(s.local + "/open-auth", { method: "POST", headers })).error, /安全验证/)
+  assert.equal(vendor.calls.filter((c) => c.url.endsWith("google-oauth-url")).length, 0, "the vendor isn't asked: it would answer a misleading 631002")
+  await s.cancel()
+})
+
+test("the receipt is passed on to the vendor unchanged, and not kept", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl }, "google")
+  const headers = { "X-Login-Token": s.token }
+  await getJson(s.local + "/captcha-config", { headers })
+  const receipt = JSON.stringify({ captchaVerifyParam: "opaque+receipt/=" })
+  assert.deepEqual(await getJson(s.local + "/captcha", { method: "POST", headers, body: JSON.stringify({ receipt }) }), { ok: true })
+  const auth = await getJson(s.local + "/open-auth", { method: "POST", headers })
+  assert.equal(auth.url, AUTH_URL)
+  assert.equal(vendor.calls.find((c) => c.url.endsWith("google-oauth-url")).body.ali_captcha_verify_param, receipt)
+  assert.deepEqual(auth.callback, {
+    redirectUri: `http://localhost:${s.callbackPort}/auth/callback-google`,
+    message: auth.callback.message,
+  })
+  assert.match(auth.callback.message, /Callback URL/)
+  await s.cancel()
+})
+
+test("only this sign-in's page can drive its server, whoever can reach the port", async () => {
+  const vendor = fakeVendor()
+  const s = await toAuthorizationPage(vendor, { vendor: "zai", loginHost: "0.0.0.0" })
+  // the page carries its token, which is what lets the page's own requests through
+  const page = await (await fetch(s.local + "/" + s.token)).text()
+  assert.ok(page.includes(s.token), "the page carries its token")
+  const headers = { "X-Login-Token": s.token }
+  for (const [path, method] of [["/captcha-config", "GET"], ["/open-auth", "POST"], ["/status", "GET"]]) {
+    assert.equal((await fetch(s.local + path, { method })).status, 403, `${path} without the token`)
+    assert.equal((await fetch(s.local + path, { method, headers: { "X-Login-Token": "0".repeat(64) } })).status, 403, `${path} with another token`)
+    assert.notEqual((await fetch(s.local + path, { method, headers })).status, 403, `${path} with the token`)
+  }
+  // another page of the plugin's isn't served without the token in its address
+  assert.equal((await fetch(s.local + "/")).status, 403)
+  assert.equal((await fetch(s.local + "/" + "a".repeat(64))).status, 403)
+  // a request from another site with the token copied is still refused by its Origin
+  assert.equal((await fetch(s.local + "/open-auth", { method: "POST", headers: { ...headers, Origin: "https://evil.example" } })).status, 403)
+  // and one from the address the page is published at is taken
+  const published = await begin({ fetchImpl: vendor.fetchImpl, loginHost: "0.0.0.0", loginPublicUrl: "https://box.example.com" }, "google")
+  assert.equal((await fetch(published.local + "/status", { headers: { ...{ "X-Login-Token": published.token }, Origin: "https://box.example.com" } })).status, 200)
+  await s.cancel()
+  await published.cancel()
+})
+
+test("closing the page does not cancel the sign-in", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl }, "zai")
+  // In a container the page is navigated away while the user signs in on the vendor's page;
+  // that must not end the sign-in. Nothing cancels it but the user, in magpie, or the timeout.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  // the page and the callback listener are still up
+  assert.equal((await fetch(s.local + "/" + s.token)).status, 200)
+  const outcome = s.callback().then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  )
+  await s.cancel()
+  assert.match((await outcome).error?.message ?? "", /取消/)
+})
+
+test("the login page's port taken", async () => {
+  const holder = net.createServer()
+  holder.listen(0, "127.0.0.1")
+  await once(holder, "listening")
+  const taken = holder.address().port
+  const vendor = fakeVendor()
+  const [callback] = await freePorts(1)
+  await assert.rejects(
+    startWebLogin("zai", { fetchImpl: vendor.fetchImpl, loginPort: taken, callbackPorts: [callback] }),
+    (error) => error.status === 400 && /登录页面端口/.test(error.message),
+  )
+  // nothing is left listening on the callback port
+  assert.equal(await portIsFree(callback), true)
+  holder.close()
+})
+
+test("every registered callback port taken", async () => {
+  const holders = []
+  for (let i = 0; i < 4; i++) {
+    const server = net.createServer()
+    server.listen(0, "127.0.0.1")
+    await once(server, "listening")
+    holders.push(server)
+  }
+  const takenPorts = holders.map((server) => server.address().port)
+  const vendor = fakeVendor()
+  const [page] = await freePorts(1)
+  await assert.rejects(
+    startWebLogin("zai", { fetchImpl: vendor.fetchImpl, loginPort: page, callbackPorts: takenPorts }),
+    (error) => error.status === 400 && /回调端口/.test(error.message),
+  )
+  // nothing is left listening on the login page's port either
+  assert.equal(await portIsFree(page), true)
+  for (const server of holders) server.close()
+})
+
+test("a vendor that can't be reached: the sign-in starts, and the page says so", async () => {
+  const down = { fetchImpl: async () => {
+    throw new Error("ECONNREFUSED")
+  } }
+  const s = await begin(down, "zai")
+  const config = await getJson(s.local + "/captcha-config", { headers: { "X-Login-Token": s.token } })
+  assert.equal(config.enabled, false)
+  assert.match(config.error, /连接失败/)
+  await s.cancel()
+})
+
+test("a refused exchange is a failed sign-in that closes the page", async () => {
+  const vendor = fakeVendor({ refuseExchange: true })
+  const s = await toAuthorizationPage(vendor, { vendor: "zai" })
+  await assert.rejects(s.callback(`code=c&state=${STATE}`), /授权码无效/)
+  await assert.rejects(fetch(s.local + "/" + s.token))
+})
+
+test("only one sign-in at a time: the previous one is replaced when a new one starts", async () => {
+  const vendor = fakeVendor()
+  const first = await begin({ fetchImpl: vendor.fetchImpl }, "zai")
+  const outcome = first.callback().then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  )
+  const second = await begin({ fetchImpl: vendor.fetchImpl }, "google")
+  // the new sign-in is up, the old one is gone
+  assert.equal((await fetch(second.local + "/" + second.token)).status, 200)
+  await assert.rejects(fetch(first.local + "/" + first.token), "the first sign-in's page is gone")
+  assert.match((await outcome).error?.message ?? "", /取代|新的登录/, "its waiting callback is told why")
+  await second.cancel()
+})
+
+test("a sign-in can be started again after one is cancelled", async () => {
+  const vendor = fakeVendor()
+  const [page, callback] = await freePorts(2)
+  const first = await startWebLogin("zai", { fetchImpl: vendor.fetchImpl, loginPort: page, callbackPorts: [callback] })
+  await first.cancel()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const second = await startWebLogin("google", { fetchImpl: vendor.fetchImpl, loginPort: page, callbackPorts: [callback] })
+  assert.equal((await fetch(second.url.replace(/^http:\/\/[^/]+/, `http://127.0.0.1:${page}`))).status, 200)
+  await second.cancel()
+})
+
+test("the host's AbortSignal ends the sign-in and closes the page", async () => {
+  const vendor = fakeVendor()
+  const controller = new AbortController()
+  const s = await webLoginMethod.authorize({ vendor: "zai" }, { signal: controller.signal, fetchImpl: vendor.fetchImpl })
+  const outcome = s.callback(undefined, { signal: controller.signal }).then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  )
+  controller.abort()
+  assert.match((await outcome).error?.message ?? "", /取消/)
+})
+
+test("an unknown vendor is refused before any port is taken", async () => {
+  const net = await import("node:net")
+  const before = (await freePorts(1))[0]
+  await assert.rejects(webLoginMethod.authorize({ vendor: "github" }, { fetchImpl: fakeVendor().fetchImpl }), /只支持.*Zai.*Google|只支持.*Zai/)
+  // the default port is free again: nothing was left listening
+  assert.equal(await new Promise((resolve) => {
+    const probe = net.createServer()
+    probe.once("error", () => resolve(false))
+    probe.listen(18433, "127.0.0.1", () => probe.close(() => resolve(true)))
+  }), true)
+  void before
+})
+
+test("the web sign-in is the first method, and asks which vendor", () => {
+  assert.equal(loginMethods[0], webLoginMethod)
   assert.equal(webLoginMethod.type, "oauth")
   assert.deepEqual(webLoginMethod.prompts[0].options.map((o) => o.value), ["zai", "google"])
-  assert.equal(tokenMethod.type, "oauth")
-  assert.equal(tokenMethod.prompts[0].type, "password")
-  assert.equal(tokenMethod.prompts[1].type, "password")
-  assert.equal(credentialJsonMethod.prompts[0].type, "password")
-  assert.equal(credentialJsonMethod.prompts[0].validate('{"token":"t"}'), undefined)
-  assert.match(credentialJsonMethod.prompts[0].validate("{bad"), /JSON 格式无效/)
-  assert.equal(tokenMethod.prompts[0].validate("  "), "请填写 access token")
-})
-
-test("the token and JSON methods: both are oauth sign-ins that go through the same check", async () => {
-  // The methods talk to the vendor; the stand-in answers with a profile, so a pasted token is completed from it.
-  const vendor = fakeVendor()
-  const viaToken = await tokenMethod.authorize({ token: JWT, refreshToken: "rt" }, { fetchImpl: vendor.fetchImpl })
-  assert.equal(viaToken.type, "success")
-  assert.equal(viaToken.access, JWT)
-  assert.equal(viaToken.refresh, "rt")
-  assert.equal(viaToken.uid, "777")
-  const viaJson = await credentialJsonMethod.authorize({ credentialJson: JSON.stringify({ token: JWT, refreshToken: "rt", userInfo: { email: "who@example.com" } }) }, { fetchImpl: vendor.fetchImpl })
-  assert.equal(viaJson.type, "success")
-  assert.equal(viaJson.email, "who@example.com")
-  // A token the vendor refuses is a failed sign-in, not a saved account.
-  const refused = async () => new Response(JSON.stringify({ code: 410000 }), { headers: { "content-type": "application/json" } })
-  await assert.rejects(tokenMethod.authorize({ token: "opaque" }, { fetchImpl: refused }), /登录态已失效/)
-})
-
-test("web sign-in: the whole loop against a stand-in vendor", async () => {
-  const vendor = fakeVendor()
-  const [port] = await freePorts(1)
-  const flow = await startLocalOauth("google", { fetchImpl: vendor.fetchImpl, ports: [port], now: () => 1_700_000_000_000 })
-  const base = `http://127.0.0.1:${port}`
-  try {
-    // 1. the guide page, with the captcha SDK's address in it
-    const page = await (await fetch(base + "/")).text()
-    assert.match(page, /AutoClaw · Google 登录/)
-    assert.ok(page.includes(ALIYUN_CAPTCHA_JS))
-    assert.equal(page.includes("<script src="), false)
-
-    // 2. the captcha config the page reads
-    const config = await (await fetch(base + "/captcha-config")).json()
-    assert.equal(config.enabled, true)
-    assert.equal(config.sceneId, "scene1")
-
-    // 3. a page on another site can't drive the local server
-    const foreign = await fetch(base + "/open-auth", { method: "POST", headers: { Origin: "https://evil.example" } })
-    assert.equal(foreign.status, 403)
-
-    // 4. the guide page hands in the captcha receipt
-    const receipt = await (await fetch(base + "/captcha", { method: "POST", headers: { Origin: base, "Content-Type": "application/json" }, body: JSON.stringify({ receipt: '{"captchaVerifyParam":"opaque-receipt"}' }) })).json()
-    assert.equal(receipt.ok, true)
-
-    // 5. without a receipt the vendor would answer 631002; with it the page gets the authorization URL
-    const auth = await (await fetch(base + "/open-auth", { method: "POST", headers: { Origin: base } })).json()
-    assert.equal(auth.url, "https://accounts.example.com/auth?state=" + STATE)
-    const urlCall = vendor.calls.find((c) => c.url.endsWith("google-oauth-url"))
-    assert.equal(urlCall.body.ali_captcha_verify_param, '{"captchaVerifyParam":"opaque-receipt"}')
-    assert.equal(urlCall.body.navigate_uri, `http://localhost:${port}/auth/callback-google`)
-    assert.equal(urlCall.body.source_id, "autoclaw")
-    assert.match(urlCall.body.device_id, /^[0-9a-f]{64}$/)
-    assert.equal(urlCall.headers.authorization, undefined)
-
-    // 6. a callback without the state, or with another one, is refused and the flow goes on
-    const forged = await fetch(`${base}/auth/callback-google?code=stolen&state=someone-elses`)
-    assert.match(await forged.text(), /state 不匹配/)
-    await sleep(50)
-    let settled = false
-    const pending = flow.callback().finally(() => {
-      settled = true
-    })
-    await sleep(50)
-    assert.equal(settled, false)
-
-    // 7. the real redirect; the code is exchanged with the state the vendor handed out
-    const landed = await fetch(`${base}/auth/callback-google?code=one-time-code&state=${STATE}`)
-    assert.match(await landed.text(), /授权成功/)
-    const result = await pending
-    assert.equal(result.type, "success")
-    assert.equal(result.access, JWT)
-    assert.equal(result.refresh, "rt-1")
-    assert.equal(result.uid, "777")
-    assert.equal(result.accountId, "ada@example.com")
-    assert.equal(result.email, "ada@example.com")
-    assert.equal(result.name, "Ada")
-    const exchange = vendor.calls.find((c) => c.url.endsWith("google-oauth-login"))
-    assert.deepEqual(
-      { code: exchange.body.code, state: exchange.body.state, navigate: exchange.body.navigate_uri, device: exchange.body.device_id === urlCall.body.device_id },
-      { code: "one-time-code", state: STATE, navigate: `http://localhost:${port}/auth/callback-google`, device: true },
-    )
-  } finally {
-    await sleep(50)
-  }
-  // the loopback port is released once the sign-in is over
-  await assert.rejects(fetch(base + "/"))
-})
-
-test("web sign-in: with the captcha on, the authorization URL needs the receipt first", async () => {
-  const vendor = fakeVendor()
-  const [port] = await freePorts(1)
-  const flow = await startLocalOauth("zai", { fetchImpl: vendor.fetchImpl, ports: [port] })
-  const base = `http://127.0.0.1:${port}`
-  try {
-    await (await fetch(base + "/captcha-config")).json()
-    // No receipt yet: the page is told so, and the vendor is not asked (it would answer a misleading 631002).
-    const early = await (await fetch(base + "/open-auth", { method: "POST" })).json()
-    assert.match(early.error, /请先完成安全验证/)
-    assert.equal(vendor.calls.filter((c) => c.url.endsWith("zai-oauth-url")).length, 0)
-    // A malformed receipt is refused the same way.
-    await fetch(base + "/captcha", { method: "POST", body: JSON.stringify({ receipt: "bad\u0001receipt" }) })
-    assert.match((await (await fetch(base + "/open-auth", { method: "POST" })).json()).error, /请先完成安全验证/)
-  } finally {
-    flow.cancel("测试结束")
-  }
-  await assert.rejects(fetch(base + "/"))
-})
-
-test("web sign-in: the host's AbortSignal ends the wait and releases the port", async () => {
-  const vendor = fakeVendor()
-  const [port] = await freePorts(1)
-  const flow = await startLocalOauth("zai", { fetchImpl: vendor.fetchImpl, ports: [port] })
-  const base = `http://127.0.0.1:${port}`
-  const controller = new AbortController()
-  const outcome = flow.callback(controller.signal).then(
-    (value) => ({ value }),
-    (error) => ({ error }),
-  )
-  await sleep(30)
-  controller.abort()
-  assert.match((await outcome).error?.message ?? "", /登录已取消/)
-  await assert.rejects(fetch(base + "/"))
-})
-
-test("web sign-in: a refused exchange is a failed sign-in that closes the port", async () => {
-  const vendor = fakeVendor({ refuseExchange: true })
-  const [port] = await freePorts(1)
-  const flow = await startLocalOauth("zai", { fetchImpl: vendor.fetchImpl, ports: [port] })
-  const base = `http://127.0.0.1:${port}`
-  await (await fetch(base + "/captcha-config")).json()
-  await fetch(base + "/captcha", { method: "POST", body: JSON.stringify({ receipt: "opaque-receipt" }) })
-  const auth = await (await fetch(base + "/open-auth", { method: "POST" })).json()
-  assert.equal(auth.error, undefined)
-  const pending = flow.callback()
-  // rejection is observed from the start, so a failure before it is awaited is not an unhandled rejection
-  const outcome = pending.then(
-    (value) => ({ value }),
-    (error) => ({ error }),
-  )
-  await fetch(`${base}/auth/callback-zai?code=c&state=${STATE}`)
-  const result = await outcome
-  assert.match(result.error?.message ?? "", /授权码无效或已过期/)
-  await assert.rejects(fetch(base + "/"))
-})
-
-test("web sign-in: a vendor with the captcha switched off needs no receipt", async () => {
-  const vendor = fakeVendor({ captchaEnabled: false })
-  const [port] = await freePorts(1)
-  const flow = await startLocalOauth("zai", { fetchImpl: vendor.fetchImpl, ports: [port] })
-  const base = `http://127.0.0.1:${port}`
-  const config = await (await fetch(base + "/captcha-config")).json()
-  assert.equal(config.enabled, false)
-  const auth = await (await fetch(base + "/open-auth", { method: "POST" })).json()
-  assert.ok(auth.url)
-  assert.equal("ali_captcha_verify_param" in vendor.calls.find((c) => c.url.endsWith("zai-oauth-url")).body, false)
-  const outcome = flow.callback().then(
-    (value) => ({ value }),
-    (error) => ({ error }),
-  )
-  await fetch(`${base}/auth/callback-zai?code=c&state=${STATE}`)
-  assert.equal((await outcome).value?.type, "success")
-})
-
-test("web sign-in: closing the guide page cancels the sign-in", async () => {
-  const vendor = fakeVendor()
-  const [port] = await freePorts(1)
-  const flow = await startLocalOauth("zai", { fetchImpl: vendor.fetchImpl, ports: [port] })
-  const base = `http://127.0.0.1:${port}`
-  const outcome = flow.callback().then(
-    (value) => ({ value }),
-    (error) => ({ error }),
-  )
-  await fetch(base + "/abort", { method: "POST", headers: { Origin: base }, body: JSON.stringify({ reason: "页面关闭" }) })
-  assert.match((await outcome).error?.message ?? "", /页面关闭/)
-  await assert.rejects(fetch(base + "/"))
-})
-
-test("web sign-in: an unknown vendor is refused before any port is taken", async () => {
-  await assert.rejects(startLocalOauth("github", { fetchImpl: fakeVendor().fetchImpl }), /只支持 Zai 或 Google/)
 })
