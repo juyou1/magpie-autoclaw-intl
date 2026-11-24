@@ -1,0 +1,66 @@
+{
+  "formatVersion": 1,
+  "plugin": "opencode-autoclaw-intl-auth",
+  "license": "AGPL-3.0-only",
+  "note": "This plugin is a JavaScript port of the AutoClaw 国际版 provider in ProvidersPlugin/Agent2Providers, which is licensed AGPL-3.0-only. As a derivative work it is published under the same license (see ../LICENSE). The parts taken from MIT-licensed works keep their own notices, included beside this file.",
+  "sources": [
+    {
+      "repository": "https://github.com/ProvidersPlugin/Agent2Providers",
+      "revision": "main, pack agent2api-wasm-autoclaw-intl 0.1.1 (workspace 3.5.0)",
+      "license": "AGPL-3.0-only",
+      "licenseFile": "../LICENSE",
+      "taken": [
+        { "from": "wasm/autoclaw-intl/src/endpoints.rs", "into": "src/util.mjs", "what": "the international origin, route paths, client versions, callback ports" },
+        { "from": "wasm/autoclaw-intl/src/headers.rs", "into": "src/headers.mjs", "what": "the three request fingerprints (business, login-activity, chat) and the X-Tm rule for Linux" },
+        { "from": "wasm/autoclaw-intl/src/client.rs", "into": "src/errors.mjs, src/api.mjs", "what": "the business envelope check and its status mapping" },
+        { "from": "wasm/autoclaw-intl/src/errors.rs", "into": "src/errors.mjs, src/relay.mjs", "what": "the four failure classes and how each is reported" },
+        { "from": "wasm/autoclaw-intl/src/prompt.rs", "into": "src/prompt.mjs", "what": "the identity line, the foreign-identity rules, the GLM sentence rule" },
+        { "from": "wasm/autoclaw-intl/src/chat.rs", "into": "src/chat.mjs, src/relay.mjs", "what": "history tidying, the dropped budget fields, the session id, the stream rules (held control frames, finish reasons, interruption)" },
+        { "from": "wasm/autoclaw-intl/src/models.rs", "into": "src/catalog.mjs, src/util.mjs", "what": "the catalog endpoint and shape, the static models, the default route, route resolution" },
+        { "from": "wasm/autoclaw-intl/src/refresh.rs", "into": "src/refresh.mjs", "what": "the refresh call, the fallback on business code 400002, the identity checks" },
+        { "from": "wasm/autoclaw-intl/src/account.rs", "into": "src/login.mjs, src/desktop.mjs", "what": "reading identity and device from the token, public fields never carrying the credential" },
+        { "from": "wasm/autoclaw-intl/src/wallets.rs", "into": "src/points.mjs", "what": "the v2 wallets, the v1 fallback, the expiring points" },
+        { "from": "wasm/autoclaw-intl/src/subscription.rs", "into": "src/points.mjs", "what": "the overseas subscription query and its bounded search" },
+        { "from": "wasm/autoclaw-intl/src/usage.rs", "into": "src/usage.mjs", "what": "points as the main result, the subscription beside it" },
+        { "from": "wasm/autoclaw-intl/src/checkin.rs", "into": "src/checkin.mjs", "what": "the daily check-in through task-complete, the per-account ledger, reading the task list before posting again" },
+        { "from": "wasm/autoclaw-intl/src/promotion.rs", "into": "src/checkin.mjs", "what": "the login-activity reward, read back from the ledger by Beijing grant_date" },
+        { "from": "wasm/autoclaw-intl/src/oauth.rs, oauth_urls.rs, web_login.rs", "into": "src/oauth.mjs, src/login.mjs", "what": "the three-step sign-in, the loopback navigate_uri, the OAuth error codes, the state check on the callback" },
+        { "from": "crates/providers/src/crypto.rs", "into": "src/desktop.mjs", "what": "the os_crypt chain: Local State key, DPAPI, AES-256-GCM with the tag at the end, enc: values" },
+        { "from": "crates/providers/src/providers/autoclaw/credentials.rs", "into": "src/desktop.mjs", "what": "reading the client's auth.json, the fallback to the gateway config" }
+      ]
+    },
+    {
+      "repository": "https://github.com/magpie-community/plugins",
+      "path": "packages/autoclaw",
+      "version": "@magpie-community/opencode-autoclaw-auth 0.2.25",
+      "license": "MIT",
+      "licenseFile": "magpie-community-MIT.txt",
+      "taken": [
+        { "into": "src/login.mjs", "what": "the shape of the local OAuth guide page and loopback server for magpie: the fixed callback ports, the same-origin check on the local write routes, the Aliyun captcha SDK loaded in the page, the session timeout" },
+        { "into": "src/refresh.mjs", "what": "single-flight refresh and the memo of rotated tokens, so a refresh token is spent once" },
+        { "into": "src/relay.mjs", "what": "handling a refusal that arrives as a 2xx JSON body or as a stream event" }
+      ]
+    },
+    {
+      "repository": "https://github.com/openclaw/openclaw",
+      "license": "MIT",
+      "licenseUrl": "https://raw.githubusercontent.com/openclaw/openclaw/main/LICENSE",
+      "licenseFile": "OpenClaw-MIT.txt",
+      "taken": [
+        { "into": "src/prompt.mjs", "what": "the identity line the official client opens with, retained as the upstream pack keeps it" }
+      ]
+    },
+    {
+      "name": "magpie plugin guide",
+      "url": "https://usemagpie.ai/docs/plugins",
+      "taken": [{ "into": "src/plugin.mjs, index.mjs, package.json", "what": "the hook contract: config, auth.methods / loader / refresh / usage / checkin, provider.models, chat.headers, the package.json fields" }]
+    }
+  ],
+  "changes": [
+    "Written in JavaScript for magpie's plugin host instead of Rust compiled to a wasm pack for Agent2API; nothing of the wasm SDK or its host protocol is used.",
+    "What the wasm pack leaves to its host (the loopback listener, the Aliyun captcha page, account and state stores, the ledger) is implemented in the plugin itself.",
+    "The sign-in state kept by magpie's own account store replaces the pack's account records and compare-and-swap updates.",
+    "The caller's conversation id from magpie is hashed together with the account before it is sent as the vendor's session header.",
+    "With the vendor's captcha switched off, the authorization URL is requested without a receipt; the wasm pack treats that as a sign-in that can't start."
+  ]
+}

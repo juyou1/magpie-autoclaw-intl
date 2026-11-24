@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+
+# test and coverage output
+coverage/
+*.test-out
+
+# editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# logs and temporary files
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,43 @@
+{
+  "name": "opencode-autoclaw-intl-auth",
+  "version": "0.1.0",
+  "description": "OpenCode provider plugin: AutoClaw 国际版 — Google / z.ai web sign-in, credential JSON or desktop sign-in import, live model catalog, credit balance, subscription and daily check-in",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "src",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "LICENSES"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "autoclaw",
+    "autoclaw-intl",
+    "zhipu",
+    "zai",
+    "glm"
+  ],
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ProvidersPlugin/Agent2Providers.git",
+    "directory": "wasm/autoclaw-intl"
+  },
+  "magpie": {
+    "name": "AutoClaw 国际版",
+    "summary": {
+      "en": "AutoClaw International: Google or z.ai web sign-in, credit balance, subscription and daily check-in.",
+      "zh": "AutoClaw 国际版：Google / z.ai 网页登录，积分余额、订阅与每日签到。"
+    },
+    "icon": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%234f6ef7'/%3E%3Ctext x='32' y='43' font-size='26' font-weight='700' text-anchor='middle' fill='white' font-family='sans-serif'%3EAC%3C/text%3E%3C/svg%3E",
+    "maxConcurrency": 8
+  }
+}
