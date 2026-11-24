@@ -58,6 +58,8 @@ docker run … -p 18433:18433 \
 | `AUTOCLAW_LOGIN_HOST` | What to listen on. `0.0.0.0` in a container, so the port can be reached from outside. |
 | `AUTOCLAW_LOGIN_PUBLIC_URL` | The address your browser opens the page at (the container's domain or IP:port), e.g. `http://box.example.com:18433`. Left unset, a desktop install works as it is (`127.0.0.1`). |
 
+**Leaving `AUTOCLAW_LOGIN_PUBLIC_URL` unset works too**: with `AUTOCLAW_LOGIN_HOST=0.0.0.0`, the first time your browser opens the login page the plugin learns the address you actually reached it at from that request's `Host` / `X-Forwarded-Host` header, and the link and instructions magpie shows use it from then on (behind a reverse proxy as well). Until one is learned, the instructions say to replace the `127.0.0.1` in the link with your machine's real address — the token part of the page's address is valid, and a hand-edited host works as it is.
+
 The page's port can be open to the network safely: the page's address carries a random token for this one sign-in, every request must bring it, and a request from another site is turned away by its Origin — knowing the port isn't enough to drive the sign-in. The callback ports (18432 and its three siblings) listen on magpie's own loopback only and need no mapping.
 
 The steps, from a container:

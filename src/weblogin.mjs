@@ -66,6 +66,9 @@ export function resetWebLogins() {
  *   AUTOCLAW_LOGIN_HOST        监听地址；容器里设 0.0.0.0，端口才能映射出去
  *   AUTOCLAW_LOGIN_PUBLIC_URL  用户浏览器访问页面用的地址（容器的域名或 IP:端口）
  * 写错的值按没设处理，不让一次笔误挡住登录。
+ * 没设 PUBLIC_URL 时：容器形态（HOST=0.0.0.0）下，浏览器第一次打开页面后，
+ * 插件从这次请求的 Host / X-Forwarded-Host 学到「用户实际用什么地址访问」，
+ * 之后给 magpie 的链接与说明用学到的地址。
  */
 export function parseLoginAddress(env = process.env) {
   const port = Number(env.AUTOCLAW_LOGIN_PORT)
@@ -83,6 +86,29 @@ export function parseLoginAddress(env = process.env) {
     port: Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_LOGIN_PORT,
     publicUrl,
   }
+}
+
+/** 只认 host[:port] 形态且端口在范围内，别把奇怪的头原样拼进给用户的 URL。 */
+const HOST_HEADER = /^[A-Za-z0-9.-]+(?::(\d{1,5}))?$/
+
+/**
+ * 从一次到达的请求里学「用户用什么地址访问登录页面」。
+ * 反向代理场景读 X-Forwarded-Host / X-Forwarded-Proto（最后一段是离插件最近的代理加的，
+ * 取第一个是离用户最近的）；没有代理时读 Host。学不到返回 null。
+ */
+export function addressFromHeaders(headers) {
+  // 两个头都可能是逗号链：第一个是离用户最近的一跳写的。
+  const proto = forwardedValue(headers["x-forwarded-proto"])?.split(",")[0]?.trim()
+  const forwardedHost = forwardedValue(headers["x-forwarded-host"])
+  const host = (forwardedHost ? forwardedHost.split(",")[0].trim() : "") || (typeof headers.host === "string" ? headers.host.trim() : "")
+  if (!host || !HOST_HEADER.test(host)) return null
+  const scheme = proto === "https" ? "https" : proto === "http" ? "http" : ""
+  return `${scheme || "http"}://${host}`.replace(/\/+$/, "")
+}
+
+function forwardedValue(value) {
+  if (Array.isArray(value)) value = value[0]
+  return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
 function isFree(port) {
@@ -209,9 +235,31 @@ class WebLogin {
       throw Object.assign(new Error(`${which} 无法监听（${what}）。请检查容器的端口映射和 AUTOCLAW_LOGIN_PORT / AUTOCLAW_LOGIN_HOST`), { status: 400 })
     }
     this.pageBase = (this.options.loginPublicUrl || `http://127.0.0.1:${loginPort}`).replace(/\/+$/, "")
+    this.pagePort = loginPort
+    /** 没设 PUBLIC_URL 且对外监听时，从到访请求学到的地址（此后链接与说明改用它）。 */
+    this.learnedBase = ""
     current = this
     this.arm(IDLE_TIMEOUT_MS)
     return this
+  }
+
+  /** 用户浏览器到访（任意路径）时学访问地址；只在明确对外监听且没设 PUBLIC_URL 时启用。 */
+  learnAddress(req) {
+    if (this.options.loginPublicUrl || this.options.loginHost !== "0.0.0.0") return
+    const forwarded = Boolean(forwardedValue(req.headers["x-forwarded-host"]))
+    const base = addressFromHeaders(req.headers)
+    if (!base || base === this.learnedBase) return
+    const host = new URL(base).hostname
+    // 直连进来的 Host 永远是容器自己的回环或内网地址，不是用户浏览器用的地址：
+    // 只有转发头带来的、或一个公网域名/IP 才值得学，否则会把学到的对外地址冲掉。
+    const loopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host)
+    if (!forwarded && loopback) return
+    this.learnedBase = base
+  }
+
+  /** magpie 拿到的链接与说明：学到了就用学到的，没学到用配置的。 */
+  exposedUrl() {
+    return this.learnedBase ? `${this.learnedBase}/${this.token}` : `${this.pageBase}/${this.token}`
   }
 
   async release() {
@@ -299,7 +347,8 @@ class WebLogin {
   /** 登录页面端口：页面本身，和页面用的接口。 */
   async servePage(req, res) {
     const url = new URL(req.url, "http://login")
-    // 页面：地址里带着令牌。
+    // 页面：地址里带着令牌。到访即学地址：此后给 magpie 的链接用用户实际访问的地址。
+    this.learnAddress(req)
     if (url.pathname === `/${this.token}`) {
       if (this.closed) return send(res, 410, "text/html; charset=utf-8", closedPageHtml("这次登录已经结束，请回到 magpie 重新发起。"))
       return send(
@@ -316,10 +365,10 @@ class WebLogin {
     const token = req.headers["x-login-token"]
     if (typeof token !== "string" || token !== this.token) return sendJson(res, 403, { error: "不是这次登录的页面" })
     if (req.method === "OPTIONS") return send(res, 204, "text/plain", "")
-    // 跨站请求即使带着令牌也不行：Origin 既不是本机，也不是页面对外的地址。
+    // 跨站请求即使带着令牌也不行：Origin 既不是本机，也不是页面配置的或学到的地址。
     const origin = req.headers.origin
-    const own = this.options.loginPublicUrl ? new URL(this.options.loginPublicUrl).origin : ""
-    if (origin && !LOCAL_ORIGIN.test(origin) && origin !== own) return sendJson(res, 403, { error: "forbidden origin" })
+    const own = [this.options.loginPublicUrl, this.learnedBase].filter(Boolean).map((base) => new URL(base).origin)
+    if (origin && !LOCAL_ORIGIN.test(origin) && !own.includes(origin)) return sendJson(res, 403, { error: "forbidden origin" })
 
     if (url.pathname === "/captcha-config" && req.method === "GET") {
       try {
@@ -403,18 +452,22 @@ class WebLogin {
     return completeFromProfile(result, this.deviceId, this.options)
   }
 
-  /** magpie 的登录方式描述。 */
+  /** magpie 的登录方式描述。学到了访问地址就用它（说明里也给出手动替换的指引）。 */
   describe() {
     const vendor = vendorLabel(this.vendor)
-    return {
-      url: `${this.pageBase}/${this.token}`,
-      instructions: [
-        `1. 打开登录页面（已自动打开；没有的话手动访问 ${this.pageBase}/${this.token}），完成安全验证。`,
-        `2. 页面会带你到 ${vendor} 的授权页，在那里登录并授权。`,
-        `3. 授权后浏览器会跳到 ${this.redirectUri}。这个页面打不开是正常的：请复制地址栏里的完整地址，粘贴到这里的回调地址（Callback URL）里。`,
-      ].join("\n"),
-      method: "code",
+    const url = this.exposedUrl()
+    const unknownHost = !this.options.loginPublicUrl && !this.learnedBase && this.options.loginHost === "0.0.0.0"
+    const lines = [
+      `1. 打开登录页面（已自动打开；没有的话手动访问 ${url}），完成安全验证。`,
+      `2. 页面会带你到 ${vendor} 的授权页，在那里登录并授权。`,
+      `3. 授权后浏览器会跳到 ${this.redirectUri}。这个页面打不开是正常的：请复制地址栏里的完整地址，粘贴到这里的回调地址（Callback URL）里。`,
+    ]
+    if (unknownHost) {
+      lines.push(
+        `提示：上面的 ${url} 里的主机名（127.0.0.1）要换成你实际访问这台机器的地址，例如 http://<服务器IP或域名>:${this.pagePort}；用浏览器打开过登录页面后，这里会自动改成正确的地址。`,
+      )
     }
+    return { url, instructions: lines.join("\n"), method: "code" }
   }
 }
 
@@ -433,6 +486,8 @@ export async function startWebLogin(vendor, options = {}) {
   await login.start()
   return {
     ...login.describe(),
+    /** 重新取一次描述：用户浏览器到访后，链接会换成学到的访问地址。 */
+    describe: () => login.describe(),
     /** 厂商会把浏览器送到的地址（端口是它登记的四个之一）。 */
     redirectUri: login.redirectUri,
     cancel: (reason) => login.cancel(reason),

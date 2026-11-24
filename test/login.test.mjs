@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { once } from "node:events"
+import * as http from "node:http"
 import * as net from "node:net"
 import { test } from "node:test"
 
@@ -454,4 +455,66 @@ test("the web sign-in is the first method, and asks which vendor", () => {
   assert.equal(loginMethods[0], webLoginMethod)
   assert.equal(webLoginMethod.type, "oauth")
   assert.deepEqual(webLoginMethod.prompts[0].options.map((o) => o.value), ["zai", "google"])
+})
+
+test("the address the user reaches the page at is learned from their request, in a container", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl, loginHost: "0.0.0.0" }, "zai")
+  // before anyone reaches it, the link magpie has is the loopback one, and the note says so
+  assert.match(s.url, /^http:\/\/127\.0\.0\.1:\d+\//)
+  assert.match(s.instructions, /127\.0\.0\.1.*换成你实际访问/)
+  // the user's browser opens the page from outside. fetch can't set Host (undici resets it),
+  // so reach it the way a browser would: a plain request with the real Host header.
+  const port = Number(new URL(s.local).port)
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path: "/" + s.token, headers: { Host: `box.example.com:${port}` } }, (res) => res.on("data", () => {}).on("end", resolve))
+    req.on("error", reject)
+    req.end()
+  })
+  const described = s.describe()
+  assert.match(described.url, /^http:\/\/box\.example\.com:\d+\/[0-9a-f]{64}$/)
+  assert.ok(!described.instructions.includes("换成你实际访问"), "the note about 127 is gone once learned")
+  assert.ok(described.instructions.includes(described.url), "the instructions name the learned address")
+  // a later request from the page's own origin passes the cross-site check, and one
+  // from anywhere else is still turned away
+  const origin = described.url.replace(/\/[0-9a-f]{64}$/, "")
+  const withOrigin = await fetch(s.local + "/status", { headers: { "X-Login-Token": s.token, Origin: origin } })
+  assert.equal(withOrigin.status, 200)
+  assert.equal((await fetch(s.local + "/status", { headers: { "X-Login-Token": s.token, Origin: "https://evil.example" } })).status, 403)
+  // a direct request whose Host is the container's own address doesn't wash it out
+  await fetch(s.local + "/" + s.token)
+  assert.match(s.describe().url, /^http:\/\/box\.example\.com:/)
+  await s.cancel()
+})
+
+test("behind a reverse proxy the forwarded host and scheme are learned", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl, loginHost: "0.0.0.0" }, "google")
+  await fetch(s.local + "/" + s.token, { headers: { "X-Forwarded-Host": "app.example.com", "X-Forwarded-Proto": "https" } })
+  const described = s.describe()
+  assert.match(described.url, /^https:\/\/app\.example\.com\/[0-9a-f]{64}$/)
+  // and a request from that origin passes
+  const outcome = await getJson(s.local + "/status", { headers: { "X-Login-Token": s.token, Origin: "https://app.example.com" } })
+  assert.deepEqual(outcome, { received: false, closed: false, error: "" })
+  await s.cancel()
+})
+
+test("a configured PUBLIC_URL is never replaced by a learned one", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl, loginHost: "0.0.0.0", loginPublicUrl: "http://set.example.com:18433" }, "zai")
+  await fetch(s.local + "/" + s.token, { headers: { Host: "box.example.com:" + s.local.split(":")[2] } })
+  assert.match(s.describe().url, /^http:\/\/set\.example\.com:18433\//)
+  // an Origin from the configured address passes; one from anywhere else still doesn't
+  assert.equal((await fetch(s.local + "/status", { headers: { "X-Login-Token": s.token, Origin: "http://set.example.com:18433" } })).status, 200)
+  assert.equal((await fetch(s.local + "/status", { headers: { "X-Login-Token": s.token, Origin: "https://evil.example" } })).status, 403)
+  await s.cancel()
+})
+
+test("a desktop install (127.0.0.1) doesn't learn an address", async () => {
+  const vendor = fakeVendor()
+  const s = await begin({ fetchImpl: vendor.fetchImpl }, "zai")
+  await fetch(s.local + "/" + s.token, { headers: { Host: "box.example.com:" + s.local.split(":")[2] } })
+  assert.match(s.describe().url, /^http:\/\/127\.0\.0\.1:\d+\//, "the loopback link stands")
+  assert.ok(!s.describe().instructions.includes("换成你实际访问"), "no note about 127 on a desktop: the link is right as it is")
+  await s.cancel()
 })
